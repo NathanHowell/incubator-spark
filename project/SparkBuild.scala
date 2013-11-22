@@ -203,7 +203,7 @@ object SparkBuild extends Build {
       "com.ning" % "compress-lzf" % "0.8.4",
       "org.xerial.snappy" % "snappy-java" % "1.0.5",
       "org.ow2.asm" % "asm" % "4.0",
-      "com.google.protobuf" % "protobuf-java" % "2.4.1",
+      "com.google.protobuf" % "protobuf-java" % "2.5.0",
       "com.typesafe.akka" % "akka-actor" % "2.0.5" excludeAll(excludeNetty),
       "com.typesafe.akka" % "akka-remote" % "2.0.5" excludeAll(excludeNetty),
       "com.typesafe.akka" % "akka-slf4j" % "2.0.5" excludeAll(excludeNetty),

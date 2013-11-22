@@ -19,7 +19,6 @@ package org.apache.spark.deploy.yarn
 
 import java.io.IOException;
 import java.net.Socket
-import java.security.PrivilegedExceptionAction
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import org.apache.hadoop.conf.Configuration
@@ -34,25 +33,23 @@ import org.apache.hadoop.yarn.ipc.YarnRPC
 import org.apache.hadoop.yarn.util.{ConverterUtils, Records}
 import org.apache.spark.{SparkContext, Logging}
 import org.apache.spark.util.Utils
-import org.apache.hadoop.security.UserGroupInformation
 import scala.collection.JavaConversions._
+import org.apache.hadoop.yarn.client.ClientRMProxy
 
 class ApplicationMaster(args: ApplicationMasterArguments, conf: Configuration) extends Logging {
 
   def this(args: ApplicationMasterArguments) = this(args, new Configuration())
-  
-  private var rpc: YarnRPC = YarnRPC.create(conf)
-  private var resourceManager: AMRMProtocol = null
+
+  private val yarnConf: YarnConfiguration = new YarnConfiguration(conf)
+  private var resourceManager: ApplicationMasterProtocol = null
   private var appAttemptId: ApplicationAttemptId = null
   private var userThread: Thread = null
-  private val yarnConf: YarnConfiguration = new YarnConfiguration(conf)
   private val fs = FileSystem.get(yarnConf)
 
   private var yarnAllocator: YarnAllocationHandler = null
   private var isFinished:Boolean = false
   private var uiAddress: String = ""
-  private val maxAppAttempts: Int = conf.getInt(YarnConfiguration.RM_AM_MAX_RETRIES,
-    YarnConfiguration.DEFAULT_RM_AM_MAX_RETRIES)
+  private val maxAppAttempts: Int = 1
   private var isLastAMRetry: Boolean = true
 
 
@@ -66,7 +63,7 @@ class ApplicationMaster(args: ApplicationMasterArguments, conf: Configuration) e
     
     appAttemptId = getApplicationAttemptId()
     isLastAMRetry = appAttemptId.getAttemptId() >= maxAppAttempts;
-    resourceManager = registerWithResourceManager()
+    resourceManager = ClientRMProxy.createRMProxy(yarnConf, classOf[ApplicationMasterProtocol])
 
     // Workaround until hadoop moves to something which has
     // https://issues.apache.org/jira/browse/HADOOP-8406 - fixed in (2.0.2-alpha but no 0.23 line)
@@ -126,33 +123,22 @@ class ApplicationMaster(args: ApplicationMasterArguments, conf: Configuration) e
   }
   
   private def getApplicationAttemptId(): ApplicationAttemptId = {
-    val envs = System.getenv()
-    val containerIdString = envs.get(ApplicationConstants.AM_CONTAINER_ID_ENV)
+    val containerIdString = System.getenv(ApplicationConstants.Environment.CONTAINER_ID.name)
     val containerId = ConverterUtils.toContainerId(containerIdString)
     val appAttemptId = containerId.getApplicationAttemptId()
     logInfo("ApplicationAttemptId: " + appAttemptId)
     return appAttemptId
   }
   
-  private def registerWithResourceManager(): AMRMProtocol = {
-    val rmAddress = NetUtils.createSocketAddr(yarnConf.get(
-      YarnConfiguration.RM_SCHEDULER_ADDRESS,
-      YarnConfiguration.DEFAULT_RM_SCHEDULER_ADDRESS))
-    logInfo("Connecting to ResourceManager at " + rmAddress)
-    return rpc.getProxy(classOf[AMRMProtocol], rmAddress, conf).asInstanceOf[AMRMProtocol]
-  }
-  
   private def registerApplicationMaster(): RegisterApplicationMasterResponse = {
     logInfo("Registering the ApplicationMaster")
     val appMasterRequest = Records.newRecord(classOf[RegisterApplicationMasterRequest])
-      .asInstanceOf[RegisterApplicationMasterRequest]
-    appMasterRequest.setApplicationAttemptId(appAttemptId)
-    // Setting this to master host,port - so that the ApplicationReport at client has some sensible info. 
+    // Setting this to master host,port - so that the ApplicationReport at client has some sensible info.
     // Users can then monitor stderr/stdout on that node if required.
     appMasterRequest.setHost(Utils.localHostName())
     appMasterRequest.setRpcPort(0)
     appMasterRequest.setTrackingUrl(uiAddress)
-    return resourceManager.registerApplicationMaster(appMasterRequest)
+    resourceManager.registerApplicationMaster(appMasterRequest)
   }
   
   private def waitForSparkMaster() {
@@ -332,13 +318,11 @@ class ApplicationMaster(args: ApplicationMasterArguments, conf: Configuration) e
 
     logInfo("finishApplicationMaster with " + status)
     val finishReq = Records.newRecord(classOf[FinishApplicationMasterRequest])
-      .asInstanceOf[FinishApplicationMasterRequest]
-    finishReq.setAppAttemptId(appAttemptId)
-    finishReq.setFinishApplicationStatus(status)
     // set tracking url to empty since we don't have a history server
+    finishReq.setFinalApplicationStatus(status)
     finishReq.setTrackingUrl("")
+    finishReq.setDiagnostics("")
     resourceManager.finishApplicationMaster(finishReq)
-
   }
 
   /**

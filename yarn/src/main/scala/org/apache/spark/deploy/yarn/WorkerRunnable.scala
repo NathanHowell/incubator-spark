@@ -29,9 +29,10 @@ import org.apache.hadoop.security.UserGroupInformation
 import org.apache.hadoop.yarn.api._
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.api.protocolrecords._
+import org.apache.hadoop.yarn.client.api.NMClient
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.hadoop.yarn.ipc.YarnRPC
-import org.apache.hadoop.yarn.util.{Apps, ConverterUtils, Records, ProtoUtils}
+import org.apache.hadoop.yarn.util.{Apps, ConverterUtils, Records}
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment
 
 import scala.collection.JavaConversions._
@@ -43,14 +44,16 @@ import org.apache.spark.util.Utils
 class WorkerRunnable(container: Container, conf: Configuration, masterAddress: String,
     slaveId: String, hostname: String, workerMemory: Int, workerCores: Int) 
     extends Runnable with Logging {
-  
-  var rpc: YarnRPC = YarnRPC.create(conf)
-  var cm: ContainerManager = null
+
   val yarnConf: YarnConfiguration = new YarnConfiguration(conf)
-  
+  val rpc: YarnRPC = YarnRPC.create(conf)
+  val cm: NMClient = NMClient.createNMClient()
+
+  cm.init(yarnConf)
+
   def run = {
     logInfo("Starting Worker Container")
-    cm = connectToCM
+    cm.start()
     startContainer
   }
   
@@ -58,10 +61,7 @@ class WorkerRunnable(container: Container, conf: Configuration, masterAddress: S
     logInfo("Setting up ContainerLaunchContext")
     
     val ctx = Records.newRecord(classOf[ContainerLaunchContext])
-      .asInstanceOf[ContainerLaunchContext]
-    
-    ctx.setContainerId(container.getId())
-    ctx.setResource(container.getResource())
+
     val localResources = prepareLocalResources
     ctx.setLocalResources(localResources)
     
@@ -101,12 +101,10 @@ class WorkerRunnable(container: Container, conf: Configuration, masterAddress: S
     }
 */
 
-    ctx.setUser(UserGroupInformation.getCurrentUser().getShortUserName())
-
     val credentials = UserGroupInformation.getCurrentUser().getCredentials()
     val dob = new DataOutputBuffer()
     credentials.writeTokenStorageToStream(dob)
-    ctx.setContainerTokens(ByteBuffer.wrap(dob.getData()))
+    ctx.setTokens(ByteBuffer.wrap(dob.getData))
 
     var javaCommand = "java";
     val javaHome = System.getenv("JAVA_HOME")
@@ -132,10 +130,7 @@ class WorkerRunnable(container: Container, conf: Configuration, masterAddress: S
     ctx.setCommands(commands)
     
     // Send the start request to the ContainerManager
-    val startReq = Records.newRecord(classOf[StartContainerRequest])
-    .asInstanceOf[StartContainerRequest]
-    startReq.setContainerLaunchContext(ctx)
-    cm.startContainer(startReq)
+    cm.startContainer(container, ctx)
   }
 
   private def setupDistributedCache(file: String,
@@ -196,28 +191,4 @@ class WorkerRunnable(container: Container, conf: Configuration, masterAddress: S
     System.getenv().filterKeys(_.startsWith("SPARK")).foreach { case (k,v) => env(k) = v }
     return env
   }
-  
-  def connectToCM: ContainerManager = {
-    val cmHostPortStr = container.getNodeId().getHost() + ":" + container.getNodeId().getPort()
-    val cmAddress = NetUtils.createSocketAddr(cmHostPortStr)
-    logInfo("Connecting to ContainerManager at " + cmHostPortStr)
-
-    // use doAs and remoteUser here so we can add the container token and not 
-    // pollute the current users credentials with all of the individual container tokens
-    val user = UserGroupInformation.createRemoteUser(container.getId().toString());
-    val containerToken = container.getContainerToken();
-    if (containerToken != null) {
-      user.addToken(ProtoUtils.convertFromProtoFormat(containerToken, cmAddress))
-    }
-
-    val proxy = user
-        .doAs(new PrivilegedExceptionAction[ContainerManager] {
-          def run: ContainerManager = {
-            return rpc.getProxy(classOf[ContainerManager],
-                cmAddress, conf).asInstanceOf[ContainerManager]
-          }
-        });
-    return proxy;
-  }
-  
 }

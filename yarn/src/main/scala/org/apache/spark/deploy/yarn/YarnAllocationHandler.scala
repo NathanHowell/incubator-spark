@@ -21,18 +21,19 @@ import org.apache.spark.Logging
 import org.apache.spark.util.Utils
 import org.apache.spark.scheduler.SplitInfo
 import scala.collection
-import org.apache.hadoop.yarn.api.records.{AMResponse, ApplicationAttemptId, ContainerId, Priority, Resource, ResourceRequest, ContainerStatus, Container}
+import org.apache.hadoop.yarn.api.ApplicationMasterProtocol
+import org.apache.hadoop.yarn.api.records.{ApplicationAttemptId, ContainerId, Priority, Resource, ResourceRequest, Container}
 import org.apache.spark.scheduler.cluster.{ClusterScheduler, CoarseGrainedSchedulerBackend}
 import org.apache.hadoop.yarn.api.protocolrecords.{AllocateRequest, AllocateResponse}
 import org.apache.hadoop.yarn.util.{RackResolver, Records}
 import java.util.concurrent.{CopyOnWriteArrayList, ConcurrentHashMap}
 import java.util.concurrent.atomic.AtomicInteger
-import org.apache.hadoop.yarn.api.AMRMProtocol
 import collection.JavaConversions._
 import collection.mutable.{ArrayBuffer, HashMap, HashSet}
 import org.apache.hadoop.conf.Configuration
 import java.util.{Collections, Set => JSet}
 import java.lang.{Boolean => JBoolean}
+import org.apache.hadoop.yarn.client.api.NMTokenCache
 
 object AllocationType extends Enumeration ("HOST", "RACK", "ANY") {
   type AllocationType = Value
@@ -46,7 +47,7 @@ object AllocationType extends Enumeration ("HOST", "RACK", "ANY") {
 // Note that right now, we assume all node asks as uniform in terms of capabilities and priority
 // Refer to http://developer.yahoo.com/blogs/hadoop/posts/2011/03/mapreduce-nextgen-scheduler/ for more info
 // on how we are requesting for containers.
-private[yarn] class YarnAllocationHandler(val conf: Configuration, val resourceManager: AMRMProtocol, 
+private[yarn] class YarnAllocationHandler(val conf: Configuration, val resourceManager: ApplicationMasterProtocol,
                                           val appAttemptId: ApplicationAttemptId,
                                           val maxWorkers: Int, val workerMemory: Int, val workerCores: Int,
                                           val preferredHostToCount: Map[String, Int], 
@@ -84,9 +85,9 @@ private[yarn] class YarnAllocationHandler(val conf: Configuration, val resourceM
     // We need to send the request only once from what I understand ... but for now, not modifying this much.
 
     // Keep polling the Resource Manager for containers
-    val amResp = allocateWorkerResources(workersToRequest).getAMResponse
+    val amResp = allocateWorkerResources(workersToRequest)
 
-    val _allocatedContainers = amResp.getAllocatedContainers()
+    val _allocatedContainers = amResp.getAllocatedContainers
     if (_allocatedContainers.size > 0) {
 
 
@@ -293,7 +294,7 @@ private[yarn] class YarnAllocationHandler(val conf: Configuration, val resourceM
 
     // Within this lock - used to read/write to the rack related maps too.
     for (container <- hostContainers) {
-      val candidateHost = container.getHostName
+      val candidateHost = container.getResourceName
       val candidateNumContainers = container.getNumContainers
       assert(YarnAllocationHandler.ANY_HOST != candidateHost)
 
@@ -371,13 +372,11 @@ private[yarn] class YarnAllocationHandler(val conf: Configuration, val resourceM
 
     val req = Records.newRecord(classOf[AllocateRequest])
     req.setResponseId(lastResponseId.incrementAndGet)
-    req.setApplicationAttemptId(appAttemptId)
 
-    req.addAllAsks(resourceRequests)
+    req.setAskList(resourceRequests)
 
     val releasedContainerList = createReleasedContainerList()
-    req.addAllReleases(releasedContainerList)
-
+    req.setReleaseList(releasedContainerList)
 
 
     if (numWorkers > 0) {
@@ -388,12 +387,14 @@ private[yarn] class YarnAllocationHandler(val conf: Configuration, val resourceM
     }
 
     for (req <- resourceRequests) {
-      logInfo("rsrcRequest ... host : " + req.getHostName + ", numContainers : " + req.getNumContainers +
+      logInfo("rsrcRequest ... host : " + req.getResourceName + ", numContainers : " + req.getNumContainers +
         ", p = " + req.getPriority().getPriority + ", capability: "  + req.getCapability)
     }
-    resourceManager.allocate(req)
-  }
 
+    val resp = resourceManager.allocate(req)
+    resp.getNMTokens.foreach(t => NMTokenCache.setNMToken(t.getNodeId.toString, t.getToken))
+    resp
+  }
 
   private def createResourceRequest(requestType: AllocationType.AllocationType, 
                                     resource:String, numWorkers: Int, priority: Int): ResourceRequest = {
@@ -438,9 +439,9 @@ private[yarn] class YarnAllocationHandler(val conf: Configuration, val resourceM
     pri.setPriority(priority)
     rsrcRequest.setPriority(pri)
 
-    rsrcRequest.setHostName(hostname)
+    rsrcRequest.setResourceName(hostname)
 
-    rsrcRequest.setNumContainers(java.lang.Math.max(numWorkers, 0))
+    rsrcRequest.setNumContainers(math.max(numWorkers, 0))
     rsrcRequest
   }
 
@@ -482,7 +483,7 @@ object YarnAllocationHandler {
 
 
   def newAllocator(conf: Configuration,
-                   resourceManager: AMRMProtocol, appAttemptId: ApplicationAttemptId,
+                   resourceManager: ApplicationMasterProtocol, appAttemptId: ApplicationAttemptId,
                    args: ApplicationMasterArguments): YarnAllocationHandler = {
 
     new YarnAllocationHandler(conf, resourceManager, appAttemptId, args.numWorkers, 
@@ -490,7 +491,7 @@ object YarnAllocationHandler {
   }
 
   def newAllocator(conf: Configuration,
-                   resourceManager: AMRMProtocol, appAttemptId: ApplicationAttemptId,
+                   resourceManager: ApplicationMasterProtocol, appAttemptId: ApplicationAttemptId,
                    args: ApplicationMasterArguments,
                    map: collection.Map[String, collection.Set[SplitInfo]]): YarnAllocationHandler = {
 
@@ -501,7 +502,7 @@ object YarnAllocationHandler {
   }
 
   def newAllocator(conf: Configuration,
-                   resourceManager: AMRMProtocol, appAttemptId: ApplicationAttemptId,
+                   resourceManager: ApplicationMasterProtocol, appAttemptId: ApplicationAttemptId,
                    maxWorkers: Int, workerMemory: Int, workerCores: Int,
                    map: collection.Map[String, collection.Set[SplitInfo]]): YarnAllocationHandler = {
 
