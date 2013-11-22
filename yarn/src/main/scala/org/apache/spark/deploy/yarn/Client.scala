@@ -30,7 +30,7 @@ import org.apache.hadoop.yarn.api._
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.api.protocolrecords._
-import org.apache.hadoop.yarn.client.YarnClientImpl
+import org.apache.hadoop.yarn.client.api.impl.YarnClientImpl
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.apache.hadoop.yarn.ipc.YarnRPC
 import org.apache.hadoop.yarn.util.{Apps, Records}
@@ -63,19 +63,20 @@ class Client(conf: Configuration, args: ClientArguments) extends YarnClientImpl 
     start()
     logClusterResourceDetails()
 
-    val newApp = super.getNewApplication()
-    val appId = newApp.getApplicationId()
+    val newApp = super.createApplication()
+    val newAppResp = newApp.getNewApplicationResponse
+    val appId = newAppResp.getApplicationId
 
-    verifyClusterResources(newApp)
+    verifyClusterResources(newAppResp)
     val appContext = createApplicationSubmissionContext(appId)
     val appStagingDir = getAppStagingDir(appId)
     val localResources = prepareLocalResources(appStagingDir)
     val env = setupLaunchEnv(localResources, appStagingDir)
-    val amContainer = createContainerLaunchContext(newApp, localResources, env)
+    val (resource, amContainer) = createContainerLaunchContext(newAppResp, localResources, env)
 
     appContext.setQueue(args.amQueue)
     appContext.setAMContainerSpec(amContainer)
-    appContext.setUser(UserGroupInformation.getCurrentUser().getShortUserName())
+    appContext.setResource(resource)
 
     submitApp(appContext)
     
@@ -324,16 +325,15 @@ class Client(conf: Configuration, args: ClientArguments) extends YarnClientImpl 
 
   def createContainerLaunchContext(newApp: GetNewApplicationResponse,
                                    localResources: HashMap[String, LocalResource],
-                                   env: HashMap[String, String]): ContainerLaunchContext = {
+                                   env: HashMap[String, String]): (Resource, ContainerLaunchContext) = {
     logInfo("Setting up container launch context")
     val amContainer = Records.newRecord(classOf[ContainerLaunchContext])
     amContainer.setLocalResources(localResources)
     amContainer.setEnvironment(env)
 
-    val minResMemory: Int = newApp.getMinimumResourceCapability().getMemory()
-
-    var amMemory = ((args.amMemory / minResMemory) * minResMemory) +
-        (if (0 != (args.amMemory % minResMemory)) minResMemory else 0) - YarnAllocationHandler.MEMORY_OVERHEAD
+    val amMemory = math.min(newApp.getMaximumResourceCapability.getMemory, args.amMemory) match {
+      case x if x > YarnAllocationHandler.MEMORY_OVERHEAD => x - YarnAllocationHandler.MEMORY_OVERHEAD
+    }
 
     // Extra options for the JVM
     var JAVA_OPTS = ""
@@ -384,17 +384,16 @@ class Client(conf: Configuration, args: ClientArguments) extends YarnClientImpl 
     logInfo("Command for the ApplicationMaster: " + commands(0))
     amContainer.setCommands(commands)
     
-    val capability = Records.newRecord(classOf[Resource]).asInstanceOf[Resource]
+    val capability = Records.newRecord(classOf[Resource])
     // Memory for the ApplicationMaster
     capability.setMemory(args.amMemory + YarnAllocationHandler.MEMORY_OVERHEAD)
-    amContainer.setResource(capability)
 
     // Setup security tokens
     val dob = new DataOutputBuffer()
     credentials.writeTokenStorageToStream(dob)
-    amContainer.setContainerTokens(ByteBuffer.wrap(dob.getData()))
+    amContainer.setTokens(ByteBuffer.wrap(dob.getData))
 
-    return amContainer
+    (capability, amContainer)
   }
   
   def submitApp(appContext: ApplicationSubmissionContext) = {
@@ -411,7 +410,7 @@ class Client(conf: Configuration, args: ClientArguments) extends YarnClientImpl 
       logInfo("Application report from ASM: \n" +
         "\t application identifier: " + appId.toString() + "\n" +
         "\t appId: " + appId.getId() + "\n" +
-        "\t clientToken: " + report.getClientToken() + "\n" +
+        "\t clientToken: " + report.getClientToAMToken() + "\n" +
         "\t appDiagnostics: " + report.getDiagnostics() + "\n" +
         "\t appMasterHost: " + report.getHost() + "\n" +
         "\t appQueue: " + report.getQueue() + "\n" +
